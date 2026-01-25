@@ -196,9 +196,44 @@ _TOKEN_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
 _QUALITY_RE = re.compile(r"(2160|1440|1080|720|480|360)\s*(p|i)?", re.IGNORECASE)
 _YEAR_RE = re.compile(r"(19|20)\d{2}")
 _SEASON_EP_RE = re.compile(
-    r"(?:s(?P<season>\d{1,2})e(?P<episode>\d{1,2})|(?P<season2>\d{1,2})x(?P<episode2>\d{1,2}))",
+    r"(?:s(?P<season>\d{1,2})e(?P<episode>\d{1,2})|(?<!\d)(?P<season2>\d{1,2})x(?P<episode2>\d{1,2})(?!\d))",
     re.IGNORECASE,
 )
+# Anime detection patterns
+_ANIME_BRACKET_GROUP_RE = re.compile(r"^\[([^\]]+)\]", re.IGNORECASE)
+
+# Known fansub groups for anime detection
+_KNOWN_FANSUB_GROUPS = {
+    "subsplease",
+    "erai-raws",
+    "horriblesubs",
+    "judas",
+    "gjm",
+    "commiesubs",
+    "commie",
+    "animekaizoku",
+    "anime time",
+    "asenshi",
+    "damedesuyo",
+    "gg",
+    "fff",
+    "underwater",
+    "ember",
+    "kametsu",
+    "kawaiika",
+    "mezashite",
+    "reinforce",
+    "senritsu",
+    "vivid",
+    "coalgirls",
+    "utw",
+    "thora",
+    "ohys-raws",
+    "leopard-raws",
+    "asw",
+    "mtbb",
+    "anime-time",
+}
 _SANITIZE_SYMBOLS_RE = re.compile(r"[\.\-_:\s]+")
 _NON_ALNUM_RE = re.compile(r"[^\w\sÀ-ÿ]")
 
@@ -209,6 +244,7 @@ CATEGORY_MOVIES_UHD = 2040
 CATEGORY_TV = 5000
 CATEGORY_TV_HD = 5030
 CATEGORY_TV_UHD = 5040
+CATEGORY_ANIME = 5070  # Anime as TV subcategory
 CATEGORY_OTHER = 7000
 
 
@@ -360,15 +396,60 @@ def _extract_release_markers(
     return info
 
 
+def _detect_anime(title: str) -> bool:
+    """
+    Detect anime releases using fansub indicators.
+
+    Requirements (all must be true):
+    1. Bracketed release group at start: [Group]
+    2. Group must be in known fansub whitelist
+    3. Episode-only numbering (- 01, Ep 01, Episode 01)
+    4. NO traditional TV patterns (S01E01, 1x02)
+
+    Returns: True if anime, False otherwise
+    """
+    # Guard: Exclude if traditional TV patterns exist
+    if _SEASON_EP_RE.search(title):
+        return False
+
+    bracket_match = _ANIME_BRACKET_GROUP_RE.search(title)
+    if not bracket_match:
+        return False
+
+    # This prevents [BBC], [PBS], [REPACK] from being detected as anime
+    group_name = bracket_match.group(1).strip().lower()
+    if group_name not in _KNOWN_FANSUB_GROUPS:
+        return False
+
+    # Remove bracketed group to avoid false matches
+    title_without_group = title[bracket_match.end() :].strip()
+
+    # Episode patterns: "- 01", "Ep 01", "Episode 01", "- 01v2", "-1090."
+    # Support up to 4 digits for long-running anime (e.g., One Piece episode 1045)
+    episode_patterns = [
+        r"[\s\-_]+\d{1,4}(?:\s*v\d+)?[\s\-_\.\(\[]",  # " - 1090 " or "-1045." or "- 01v2 -"
+        r"[\s\-_]Ep?\.?\s*\d{1,4}",  # "- Ep01" or " E1045"
+        r"[\s\-_]Episode\s*\d{1,4}",  # "- Episode 01" or "- Episode 1045"
+    ]
+
+    has_episode = any(
+        re.search(pattern, title_without_group, re.IGNORECASE)
+        for pattern in episode_patterns
+    )
+
+    return has_episode
+
+
 def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
     """
     Detect Newznab category based on filename and extracted metadata.
 
     Detection logic:
-    1. TV shows: presence of season/episode patterns (SxxExx or xxyy)
-    2. Movies: presence of year, absence of TV patterns
-    3. Resolution subcategories: 720p+ = HD, 2160p/4K/UHD = UHD
-    4. Default to generic categories if uncertain
+    1. Anime: bracketed fansub groups + episode-only patterns (PRIORITY)
+    2. TV shows: presence of season/episode patterns (SxxExx or xxyy)
+    3. Movies: presence of year, absence of TV patterns
+    4. Resolution subcategories: 720p+ = HD, 2160p/4K/UHD = UHD (TV/Movies only)
+    5. Default to generic categories if uncertain
 
     Args:
         title: The filename/title to analyze
@@ -377,15 +458,16 @@ def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
     Returns:
         Newznab category ID (int)
     """
+    # Check for anime FIRST (priority detection)
+    if _detect_anime(title):
+        return CATEGORY_ANIME  # 5070 - No quality subcategories
+
     season = metadata.get("season")
     episode = metadata.get("episode")
     quality = metadata.get("quality")
     year = metadata.get("year")
 
-    # Normalize quality for comparison
     quality_lower = (quality or "").lower()
-
-    # Determine if HD or UHD based on resolution
     is_uhd = False
     is_hd = False
 
@@ -397,16 +479,12 @@ def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
         elif "720" in quality_lower or "1080" in quality_lower:
             is_hd = True
 
-    # Check for TV show indicators
     has_tv_pattern = season is not None or episode is not None
 
-    # Additional TV pattern check in title (case insensitive)
     if not has_tv_pattern:
-        # Look for common TV patterns that might be missed
         if _SEASON_EP_RE.search(title):
             has_tv_pattern = True
 
-    # Categorize as TV show
     if has_tv_pattern:
         if is_uhd:
             return CATEGORY_TV_UHD  # 5040
@@ -415,7 +493,6 @@ def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
         else:
             return CATEGORY_TV  # 5000
 
-    # Categorize as Movie (if has year or appears to be a movie)
     # Movies typically have a year but no season/episode
     if year or (not has_tv_pattern):
         if is_uhd:
@@ -491,7 +568,7 @@ def filter_and_map(
             ext = it.get("ext") or it.get("11")
             size = it.get("size", 0)
             poster = it.get("poster") or it.get("7")
-            posted_raw = it.get("dtime") or it.get("date") or it.get("12")
+            posted_raw = it.get("timestamp") or it.get("ts") or it.get("dtime") or it.get("date") or it.get("12")
             sig = it.get("sig")
             display_fn = it.get("fn") or it.get("filename")
             extension_field = it.get("extension") or it.get("ext")
@@ -620,6 +697,7 @@ def api():
             '<category id="5000" name="TV">'
             '<subcat id="5030" name="TV/HD"/>'
             '<subcat id="5040" name="TV/UHD"/>'
+            '<subcat id="5070" name="TV/Anime"/>'
             "</category>"
             '<category id="7000" name="Other"/>'
             "</categories>"
@@ -629,6 +707,7 @@ def api():
 
     if t in ("search", "movie", "tvsearch"):
         base_query = (request.args.get("q") or "").strip()
+        cat_param = request.args.get("cat") or ""
         season_param = request.args.get("season") or request.args.get("seasonnum")
         episode_param = (
             request.args.get("ep")
@@ -662,7 +741,19 @@ def api():
         if (
             not q or q.lower() == "test"
         ):  # allow Prowlarr validation calls to receive data
-            q = "matrix"
+            # Check if TV/Anime categories are requested
+            tv_categories = {"5000", "5030", "5040"}
+            anime_categories = {"5070"}
+            requested_categories = set(cat_param.split(",")) if cat_param else set()
+            wants_tv = t == "tvsearch" or bool(requested_categories & tv_categories)
+            wants_anime = bool(requested_categories & anime_categories)
+            # Use appropriate fallback query
+            if wants_anime:
+                q = "one piece"  # Anime fallback
+            elif wants_tv:
+                q = "breaking bad"  # TV fallback
+            else:
+                q = "matrix"  # Movie fallback
             fallback_query = True
         query_tokens = _tokenize(raw_query)
         query_meta = _extract_release_markers(raw_query)
@@ -694,19 +785,58 @@ def api():
         min_bytes = min_size_mb * 1024 * 1024
 
         if fallback_query:
-            items = [
-                {
-                    "hash": "SAMPLEHASH1234567890",
-                    "filename": "sample.matrix.clip",
-                    "ext": ".mkv",
-                    "sig": None,
-                    "size": 700 * 1024 * 1024,
-                    "title": "Sample Matrix Clip",
-                    "sample": True,
-                    "poster": "sample@example.com",
-                    "posted": int(time.time()),
-                }
-            ]
+            # Check if TV/Anime categories are requested
+            tv_categories = {"5000", "5030", "5040"}
+            anime_categories = {"5070"}
+            requested_categories = set(cat_param.split(",")) if cat_param else set()
+            wants_tv = t == "tvsearch" or bool(requested_categories & tv_categories)
+            wants_anime = bool(requested_categories & anime_categories)
+
+            if wants_anime:
+                # Anime-appropriate fallback
+                items = [
+                    {
+                        "hash": "SAMPLEHASH_ANIME123",
+                        "filename": "sample.anime.series.01.720p.mkv",
+                        "ext": ".mkv",
+                        "sig": None,
+                        "size": 350 * 1024 * 1024,
+                        "title": "[SampleSubs] Sample Anime Series - 01 [720p]",
+                        "sample": True,
+                        "poster": "sample@example.com",
+                        "posted": int(time.time()),
+                    }
+                ]
+            elif wants_tv:
+                # TV-appropriate fallback for Sonarr
+                items = [
+                    {
+                        "hash": "SAMPLEHASH_TV123456",
+                        "filename": "sample.tv.show.s01e01.1080p.mkv",
+                        "ext": ".mkv",
+                        "sig": None,
+                        "size": 800 * 1024 * 1024,
+                        "title": "Sample TV Show S01E01 1080p",
+                        "sample": True,
+                        "poster": "sample@example.com",
+                        "posted": int(time.time()),
+                    }
+                ]
+            else:
+                # Movie fallback for Radarr
+                items = [
+                    {
+                        "hash": "SAMPLEHASH1234567890",
+                        "filename": "sample.matrix.clip",
+                        "ext": ".mkv",
+                        "sig": None,
+                        "size": 700 * 1024 * 1024,
+                        "title": "Sample Matrix Clip",
+                        "sample": True,
+                        "poster": "sample@example.com",
+                        "posted": int(time.time()),
+                    }
+                ]
         else:
             c = client()
             # aim for maximum results per page
@@ -766,7 +896,6 @@ def api():
             season = it.get("season")
             episode = it.get("episode")
 
-            # Detect category based on title and metadata
             title_text = it.get("title", "")
             title_metadata = {
                 "season": season,
