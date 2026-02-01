@@ -11,6 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8081
+ENV PORT=8081
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8081", "--workers", "4", "server:APP"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 4 server:APP"]
